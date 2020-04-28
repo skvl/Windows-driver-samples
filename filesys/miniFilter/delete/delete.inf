@@ -15,8 +15,9 @@ CatalogFile = delete.cat
 
 
 [DestinationDirs]
-DefaultDestDir          = 12
-MiniFilter.DriverFiles  = 12            ;%windir%\system32\drivers
+DefaultDestDir                = 12
+MiniFilter.DeleteDriverFiles  = 12            ;%windir%\system32\drivers
+MiniFilter.CopyDriverFiles    = 12            ;%windir%\system32\drivers
 
 ;;
 ;; Default install sections
@@ -24,7 +25,7 @@ MiniFilter.DriverFiles  = 12            ;%windir%\system32\drivers
 
 [DefaultInstall]
 OptionDesc          = %ServiceDescription%
-CopyFiles           = MiniFilter.DriverFiles
+CopyFiles           = MiniFilter.CopyDriverFiles
 
 [DefaultInstall.Services]
 AddService          = %ServiceName%,,MiniFilter.Service
@@ -34,7 +35,7 @@ AddService          = %ServiceName%,,MiniFilter.Service
 ;;
 
 [DefaultUninstall]
-DelFiles   = MiniFilter.DriverFiles
+DelFiles   = MiniFilter.DeleteDriverFiles
 
 [DefaultUninstall.Services]
 DelService = %ServiceName%,0x200      ;Ensure service is stopped before deleting
@@ -69,8 +70,11 @@ HKR,"Instances\"%Instance1.Name%,"Flags",0x00010001,%Instance1.Flags%
 ; Copy Files
 ;
 
-[MiniFilter.DriverFiles]
-%DriverName%.sys
+[MiniFilter.CopyDriverFiles]
+%DriverName%.sys,,,0x00002000 ;COPYFLG_NOPRUNE
+
+[MiniFilter.DeleteDriverFiles]
+%DriverName%.sys,,,0x00010001 ;(DELFLG_IN_USE | DELFLG_IN_USE1)
 
 [SourceDisksFiles]
 delete.sys = 1,,
