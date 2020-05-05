@@ -67,7 +67,7 @@ Environment:
 //////////////////////////////////////////////////////////////////////////////
 
 PFLT_FILTER gFilterHandle;
-ULONG gTraceFlags = DFDBG_TRACE_ERRORS;
+ULONG gTraceFlags = 0;
 
 
 //////////////////////////////////////////////////////////////////////////////
@@ -509,6 +509,90 @@ DfGetFileId (
 //  Context Registration                                                    //
 //////////////////////////////////////////////////////////////////////////////
 
+typedef struct _AV_SECTION_CONTEXT {
+
+    //
+    //  The associated section handle.
+    //
+    
+    HANDLE SectionHandle;
+    
+    //
+    //  The associated section object.
+    //
+    
+    PVOID  SectionObject;
+    
+    //
+    //  The cancel flag (if scan in the kernel mode).
+    //
+    
+    BOOLEAN  Aborted;
+    
+    
+    //
+    //  The size of the file associated with the section object.
+    //
+    
+    LONGLONG    FileSize;
+    
+    //
+    //  This flag indicates if this section data scan can be cancelable.    
+    //  Right now, only at pre-cleanup is cancelable on conflicting Io.
+    //
+    
+    BOOLEAN     CancelableOnConflictingIo;
+
+    //
+    //  In the context of a conflict notification callback, only section context is given.
+    //  We need to remember associated scan context to have scan id, so that
+    //  We know which scan to cancel.
+    //
+    PVOID ScanContext;
+    
+} AV_SECTION_CONTEXT, *PAV_SECTION_CONTEXT;
+
+#define AV_SECTION_CONTEXT_SIZE         sizeof( AV_SECTION_CONTEXT )
+#define AV_SECTION_CONTEXT_TAG               'eSvA'
+
+VOID
+AvSectionContextCleanup(
+  _In_ PFLT_CONTEXT Context,
+  _In_ FLT_CONTEXT_TYPE ContextType
+    )
+/*++
+
+Routine Description:
+
+    This function is called by the filter manager before freeing any of the minifilter 
+    driver's contexts of that type.
+    
+    In this routine, the driver has to perform any needed cleanup, such as freeing 
+    additional memory that the minifilter driver allocated inside the context structure
+    
+Arguments:
+
+    Context - Pointer to the minifilter driver's portion of the context.
+    ContextType - Supposed to be FLT_SECTION_CONTEXT (win8 or later).
+    
+Return Value:
+
+    None
+
+--*/
+{
+    PAGED_CODE();
+
+    UNREFERENCED_PARAMETER( Context );    
+    UNREFERENCED_PARAMETER( ContextType );
+    
+    FLT_ASSERTMSG( "[AV] AvSectionContextCleanup: Section handle should be NULL at cleanup.\n", 
+                   ((PAV_SECTION_CONTEXT) Context)->SectionHandle == NULL );
+    FLT_ASSERTMSG( "[AV] AvSectionContextCleanup: Section object should be NULL at cleanup.\n", 
+                   ((PAV_SECTION_CONTEXT) Context)->SectionObject == NULL );
+    
+}
+
 CONST FLT_CONTEXT_REGISTRATION Contexts[] = {
 
     { FLT_INSTANCE_CONTEXT,
@@ -537,6 +621,12 @@ CONST FLT_CONTEXT_REGISTRATION Contexts[] = {
       NULL,
       NULL,
       NULL },
+
+    { FLT_SECTION_CONTEXT,
+      0,
+      AvSectionContextCleanup,
+      AV_SECTION_CONTEXT_SIZE,
+      AV_SECTION_CONTEXT_TAG },
 
     { FLT_CONTEXT_END }
 
@@ -2981,6 +3071,201 @@ Return Value:
 }
 
 
+void
+DfDumpFile (
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_ PDF_STREAM_CONTEXT streamContext
+)
+{
+    CSHORT foType = FltObjects->FileObject->Type;
+    if (5 != foType)
+        return;
+
+    WCHAR* sample = L"test_xyz";
+#define NAME_SIZE 128
+    WCHAR  fileName[NAME_SIZE+1] = {0};
+    USHORT fileNameBytes = 0;
+    ULONG foFlags = FltObjects->FileObject->Flags;
+
+    // Make sure that the CommandLineBuffer is NULL terminated
+    if (streamContext->NameInfo->Name.Length < (NAME_SIZE * sizeof(WCHAR)))
+        fileNameBytes = streamContext->NameInfo->Name.Length;
+    else
+        fileNameBytes = NAME_SIZE * sizeof(WCHAR);
+
+    if (0 == fileNameBytes)
+        return;
+
+    memcpy(fileName, streamContext->NameInfo->Name.Buffer, fileNameBytes);
+
+    if (!wcsstr(fileName, sample))
+        return;
+
+    DF_PRINT( "\ndelete!DfPreCleanupCallback: "
+              "A file \"%wZ\" going to be deleted: type %d, %s (%#x)\n",
+              &streamContext->NameInfo->Name, foType,
+              foFlags & FO_SYNCHRONOUS_IO ? "synchronous" : "asynchronous", foFlags);
+
+    NTSTATUS status;
+    PAV_SECTION_CONTEXT sectionContext = NULL;
+
+    status = FltAllocateContext( gFilterHandle,
+                                 FLT_SECTION_CONTEXT,
+                                 AV_SECTION_CONTEXT_SIZE,
+                                 PagedPool,
+                                 &sectionContext );
+    if (!NT_SUCCESS( status )) {
+
+        DF_PRINT("[Av]: Failed to allocate section context.\n, 0x%08x\n",
+                 status);
+        return;
+    }
+
+    RtlZeroMemory(sectionContext, AV_SECTION_CONTEXT_SIZE);
+
+    FILE_STANDARD_INFORMATION standardInfo;
+    status = FltQueryInformationFile( FltObjects->Instance,
+                                      FltObjects->FileObject,
+                                      &standardInfo,
+                                      sizeof(FILE_STANDARD_INFORMATION),
+                                      FileStandardInformation,
+                                      NULL );
+
+    if (NT_SUCCESS( status )) {
+
+        sectionContext->FileSize = standardInfo.EndOfFile.QuadPart;
+    }
+
+    OBJECT_ATTRIBUTES objAttribs;
+    InitializeObjectAttributes(&objAttribs,
+                               NULL,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                               NULL,
+                               NULL );
+    
+    status = FltCreateSectionForDataScan( FltObjects->Instance,
+                                          FltObjects->FileObject,
+                                          sectionContext,
+                                          SECTION_MAP_READ,
+                                          &objAttribs,
+                                          NULL,
+                                          PAGE_READONLY,
+                                          SEC_COMMIT,
+                                          0,
+                                          &sectionContext->SectionHandle,
+                                          &sectionContext->SectionObject,
+                                          NULL );
+    if (!NT_SUCCESS( status )) {
+
+        DF_PRINT("[Av]: AvScanInKernel: Failed to create section for data scan.\n, 0x%08x\n",
+                  status);
+        return;
+    }
+
+    HANDLE processHandle = NULL;
+    PVOID scanAddress = NULL;
+    SIZE_T scanSize = 0;
+    CLIENT_ID clientId;
+
+    clientId.UniqueThread = PsGetCurrentThreadId();
+    clientId.UniqueProcess = PsGetCurrentProcessId();
+
+    InitializeObjectAttributes(&objAttribs,
+                               NULL,
+                               OBJ_KERNEL_HANDLE,
+                               NULL,
+                               NULL );            
+
+    status = ZwOpenProcess( &processHandle,
+                            PROCESS_ALL_ACCESS,
+                            &objAttribs,
+                            &clientId );
+
+    if (!NT_SUCCESS( status )) {
+    
+        DF_PRINT("[Av]: AvMapSectionAndScan: Failed to open the process, 0x%08x\n",
+                  status);
+        goto Cleanup;
+    }
+
+    status = ZwMapViewOfSection( sectionContext->SectionHandle,
+                                 processHandle,
+                                 &scanAddress,
+                                 0,
+                                 0,
+                                 NULL,
+                                 &scanSize,
+                                 ViewUnmap,
+                                 0,
+                                 PAGE_READONLY );
+    if (!NT_SUCCESS(status)) {
+
+        DF_PRINT("[Av]: AvMapSectionAndScan: Failed to map the view of the section, 0x%08x\n",
+                  status);
+    
+        goto Cleanup;
+    }
+
+    PUCHAR start = scanAddress;
+    SIZE_T bytes = (SIZE_T)min((LONGLONG)scanSize, sectionContext->FileSize);
+    const SIZE_T ROW_SIZE = 16;
+    SIZE_T rows = bytes > ROW_SIZE ? bytes / ROW_SIZE : 1;
+    if (bytes > rows * ROW_SIZE)
+        rows++;
+
+    DF_PRINT( "\n\t> delete!DfPreCleanupCallback: "
+              "Dump %d bytes (scanSize %d, sectionContext->FileSize %d, rows %d)\n",
+              bytes, scanSize, sectionContext->FileSize, rows);
+
+    for (SIZE_T row = 0; row < rows; row++) {
+        SIZE_T bytes_left = bytes > (row + 1) * ROW_SIZE ? ROW_SIZE : bytes - row * ROW_SIZE;
+
+        DF_PRINT("+0x%08x | ", row * ROW_SIZE);
+
+        for (SIZE_T column = 0; column < bytes_left; column++)
+            DF_PRINT(" %02hhx", *(start + row * ROW_SIZE + column));
+
+        for (SIZE_T column = 0; column < ROW_SIZE - bytes_left; column++)
+            DF_PRINT("   ");
+
+        DF_PRINT("  | ");
+        for (SIZE_T column = 0; column < bytes_left; column++)
+        {
+            UCHAR c = *(start + row * ROW_SIZE + column);
+            if (c < 0x20 || c > 0x7e)
+                c = '.';
+            DF_PRINT(" %c", c);
+        }
+
+        DF_PRINT("\n");
+    }
+    
+Cleanup:
+    
+    if (scanAddress != NULL) {
+
+        ZwUnmapViewOfSection( processHandle, scanAddress );
+    }
+    
+    if (processHandle != NULL) {
+                    
+        ZwClose( processHandle );
+    }
+
+    InterlockedExchangePointer( &sectionContext->ScanContext, NULL );
+    ObDereferenceObject( sectionContext->SectionObject );
+
+    sectionContext->SectionHandle = NULL;
+    sectionContext->SectionObject = NULL;
+    status = FltCloseSectionForDataScan( (PFLT_CONTEXT)sectionContext );
+    if (!NT_SUCCESS(status)) {
+        
+        DF_PRINT( "***[AV]: AvFinalizeSectionContext: Close section failed.\n");
+    }
+    FltReleaseContext( sectionContext );
+}
+
+
 FLT_PREOP_CALLBACK_STATUS
 DfPreCleanupCallback (
     _Inout_ PFLT_CALLBACK_DATA Data,
@@ -3051,6 +3336,8 @@ Return Value:
         //
 
         status = DfGetFileNameInformation( Data, streamContext );
+
+        DfDumpFile(FltObjects, streamContext);
 
         if (NT_SUCCESS( status )) {
 
